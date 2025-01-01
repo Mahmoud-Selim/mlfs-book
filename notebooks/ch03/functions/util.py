@@ -287,14 +287,72 @@ def check_file_path(file_path):
     else:
         print(f"File successfully found at the path: {file_path}")
 
-def backfill_predictions_for_monitoring(weather_fg, air_quality_df, monitor_fg, model):
+def backfill_predictions_for_monitoring_using_no_lagged_features(weather_fg, air_quality_df, monitor_fg, model):
     features_df = weather_fg.read()
     features_df = features_df.sort_values(by=['date'], ascending=True)
     features_df = features_df.tail(10)
+    #print(features_df)
     features_df['predicted_pm25'] = model.predict(features_df[['temperature_2m_mean', 'precipitation_sum', 'wind_speed_10m_max', 'wind_direction_10m_dominant']])
     df = pd.merge(features_df, air_quality_df[['date','pm25','street','country']], on="date")
     df['days_before_forecast_day'] = 1
     hindcast_df = df
     df = df.drop('pm25', axis=1)
     monitor_fg.insert(df, write_options={"wait_for_job": True})
+    return hindcast_df
+
+import pandas as pd
+import numpy as np
+
+def backfill_predictions_for_monitoring(weather_fg, air_quality_df, monitor_fg, model, X_test_adjusted, lags=3):
+    """
+    Backfill predictions for monitoring with autoregressive lagged pm25 predictions.
+
+    Parameters:
+        weather_fg: Feature group for weather data.
+        air_quality_df (pd.DataFrame): Air quality data including `pm25`.
+        monitor_fg: Feature group for monitoring results.
+        model: Trained model for predicting `pm25`.
+        X_test_adjusted (pd.DataFrame): Historical data containing lagged `pm25` features.
+        lags (int): Number of lagged `pm25` features to include (default: 3).
+
+    Returns:
+        pd.DataFrame: Hindcast DataFrame with actual and predicted values.
+    """
+    # Read and prepare the weather data
+    features_df = weather_fg.read()
+    features_df = features_df.sort_values(by=['date'], ascending=True)
+    features_df = features_df.tail(10)  # Only the last 10 rows for predictions
+
+    # Initialize predictions list
+    predictions = []
+
+    # Start with the last known lagged pm25 values from X_test_adjusted
+    lagged_pm25 = X_test_adjusted.iloc[-1][[f'pm25_lag_{i}' for i in range(1, lags + 1)]].values.tolist()
+
+    # Iterate through the rows in features_df for autoregressive predictions
+    for index, row in features_df.iterrows():
+        # Create input for the model by combining weather features and lagged pm25
+        model_input = row[['temperature_2m_mean', 'precipitation_sum', 
+                           'wind_speed_10m_max', 'wind_direction_10m_dominant']].tolist()
+        model_input.extend(lagged_pm25)  # Add lagged pm25 values
+
+        # Predict pm25 for the current day
+        predicted_pm25 = model.predict(np.array([model_input]))[0]
+        predictions.append(predicted_pm25)
+
+        # Update lagged pm25 values for the next prediction
+        lagged_pm25 = [predicted_pm25] + lagged_pm25[:-1]
+
+    # Add predictions to the DataFrame
+    features_df['predicted_pm25'] = predictions
+
+    # Merge with air quality data for hindcasting
+    df = pd.merge(features_df, air_quality_df[['date', 'pm25', 'street', 'country']], on="date")
+    df['days_before_forecast_day'] = 1  # Add a tracking column for forecast day
+
+    # Prepare monitoring data for insertion
+    hindcast_df = df.copy()  # Save hindcast DataFrame for output
+    df = df.drop('pm25', axis=1)  # Remove actual `pm25` from monitoring data
+    monitor_fg.insert(df, write_options={"wait_for_job": True})  # Insert into monitoring feature group
+
     return hindcast_df
