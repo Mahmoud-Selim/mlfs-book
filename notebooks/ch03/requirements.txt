@@ -20,3 +20,5 @@ matplotlib==3.8.3
 
 # Jupyter notebook
 notebook
+
+pyarrow
